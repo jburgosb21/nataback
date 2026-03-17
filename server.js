@@ -21,7 +21,13 @@ function parseCorsOrigins() {
   // CORS_ORIGIN ejemplo:
   // - "http://localhost:5173,http://localhost:8888,https://tu-app.netlify.app"
   const raw = (process.env.CORS_ORIGIN || "").trim();
-  const defaults = new Set(["http://localhost:3000", "http://localhost:5173"]);
+  const defaults = new Set([
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:8080",
+    "https://nataback.netlify.app",
+    "https://nataback.onrender.com",
+  ]);
   if (!raw) return [...defaults];
   const parts = raw
     .split(",")
@@ -116,6 +122,12 @@ async function initTables() {
 
     ALTER TABLE order_items
       ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1;
+
+    ALTER TABLE order_items
+      DROP CONSTRAINT IF EXISTS order_items_size_check;
+
+    ALTER TABLE order_items
+      ADD CONSTRAINT order_items_size_check CHECK (size IN ('mini','pequeno','mediano','grande','galleta'));
   `;
   await pool.query(schema);
 }
@@ -425,6 +437,7 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
     pequeno: 2500,
     mediano: 3000,
     grande: 4000,
+    galleta: 500,
   };
   const EXTRA_GALLETA_PRICE = 500;
   const validLocations = new Set(["zona-a", "zona-b", "parqueadero", "patio"]);
@@ -451,14 +464,19 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
 
     for (const it of items) {
       const size = normalizeString(it.size, 16);
-      if (!PRICE_BY_SIZE[size]) {
+      if (!Object.prototype.hasOwnProperty.call(PRICE_BY_SIZE, size)) {
+        console.log(`[ORDERS] Tamaño inválido recibido: ${size}`);
         return res.status(400).json({ error: `Tamaño inválido: ${size}` });
       }
 
       const quantity = Number.isInteger(it.quantity) && it.quantity > 0 ? it.quantity : 1;
+      const isCookie = size === "galleta";
       const sabores = normalizeSabores(it.sabores);
-      if (sabores.length === 0) {
+      if (!isCookie && sabores.length === 0) {
         return res.status(400).json({ error: "Cada helado debe tener al menos 1 sabor" });
+      }
+      if (isCookie && sabores.length === 0) {
+        sabores.push("galleta");
       }
 
       const extras = typeof it.extras === "object" && it.extras ? it.extras : {};
@@ -466,7 +484,7 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
         salsa: !!extras.salsa,
         tajin: !!extras.tajin,
         chispa: !!extras.chispa,
-        galleta: !!extras.galleta,
+        galleta: Number.isInteger(extras.galleta) && extras.galleta > 0 ? extras.galleta : 0,
       };
 
       const location = normalizeString(it.location, 20);
@@ -475,10 +493,13 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
       }
 
       const plate = normalizeString(it.plate, 12).toUpperCase();
+      if (!plate) {
+        return res.status(400).json({ error: "Placa o cliente es requerido en cada item" });
+      }
       const observation = normalizeString(it.observation, 240);
 
       const base = PRICE_BY_SIZE[size];
-      const extrasPrice = extrasNormalized.galleta ? EXTRA_GALLETA_PRICE : 0;
+      const extrasPrice = (extrasNormalized.galleta || 0) * EXTRA_GALLETA_PRICE;
       const itemTotal = (base + extrasPrice) * quantity;
 
       orderTotal += itemTotal;

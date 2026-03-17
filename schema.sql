@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS order_items (
   order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
   plate TEXT,
   location TEXT,
-  size TEXT NOT NULL CHECK (size IN ('mini', 'pequeno', 'mediano', 'grande')),
+  size TEXT NOT NULL CHECK (size IN ('mini', 'pequeno', 'mediano', 'grande', 'galleta')),
   sabores TEXT[] NOT NULL,
   extras JSONB NOT NULL,
   total INTEGER NOT NULL
