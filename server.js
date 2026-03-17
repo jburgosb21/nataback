@@ -421,13 +421,13 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
   }
 
   const PRICE_BY_SIZE = {
-    pequeno: 2000,
+    mini: 2000,
+    pequeno: 2500,
     mediano: 3000,
     grande: 4000,
-    mini: 1500,
   };
   const EXTRA_GALLETA_PRICE = 500;
-  const validLocations = new Set(["parqueadero", "calle", "mesas"]);
+  const validLocations = new Set(["zona-a", "zona-b", "parqueadero", "patio"]);
 
   function normalizeString(s, maxLen) {
     if (typeof s !== "string") return "";
@@ -464,6 +464,7 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
       const extras = typeof it.extras === "object" && it.extras ? it.extras : {};
       const extrasNormalized = {
         salsa: !!extras.salsa,
+        tajin: !!extras.tajin,
         chispa: !!extras.chispa,
         galleta: !!extras.galleta,
       };
