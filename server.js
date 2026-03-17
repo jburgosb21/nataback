@@ -69,6 +69,14 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const orderLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Demasiadas órdenes en un corto tiempo, intenta de nuevo más tarde.",
+});
+
 // Inicializa las tablas necesarias
 async function initTables() {
   const schema = `
@@ -92,17 +100,29 @@ async function initTables() {
     CREATE TABLE IF NOT EXISTS orders (
       id SERIAL PRIMARY KEY,
       mesero_id INTEGER REFERENCES users(id),
+      client_plate TEXT,
       total INTEGER NOT NULL,
       status TEXT NOT NULL CHECK (status IN ('pending','cocinando','apunto_salida','entregado','cancelled')) DEFAULT 'pending',
       observation TEXT,
+      paid BOOLEAN NOT NULL DEFAULT FALSE,
+      payment_method TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS client_plate TEXT;
 
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS observation TEXT;
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS paid BOOLEAN NOT NULL DEFAULT FALSE;
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS payment_method TEXT;
 
     CREATE TABLE IF NOT EXISTS order_items (
       id SERIAL PRIMARY KEY,
@@ -328,30 +348,83 @@ app.patch("/users/:id", authMiddleware, requireRole(ROLES.ADMIN), async (req, re
 
 app.get("/stats", authMiddleware, requireRole(ROLES.ADMIN), async (req, res) => {
   try {
-    const daily = await pool.query(
-      `SELECT to_char(created_at, 'YYYY-MM-DD') AS period, COUNT(*) AS count, SUM(total) AS total
-       FROM orders
-       GROUP BY period
-       ORDER BY period DESC
-       LIMIT 30`
+    const [daily, weekly, yearly] = await Promise.all([
+      pool.query(
+        `SELECT to_char(created_at, 'YYYY-MM-DD') AS period, COUNT(*) AS count, SUM(total) AS total
+         FROM orders
+         GROUP BY period
+         ORDER BY period DESC
+         LIMIT 30`
+      ),
+      pool.query(
+        `SELECT to_char(date_trunc('week', created_at), 'IYYY-IW') AS period, COUNT(*) AS count, SUM(total) AS total
+         FROM orders
+         GROUP BY period
+         ORDER BY period DESC
+         LIMIT 12`
+      ),
+      pool.query(
+        `SELECT date_part('year', created_at)::int AS period, COUNT(*) AS count, SUM(total) AS total
+         FROM orders
+         GROUP BY period
+         ORDER BY period DESC`
+      ),
+    ]);
+
+    const totalsRes = await pool.query(
+      `SELECT
+         COUNT(*) AS total_orders,
+         COALESCE(SUM(total), 0) AS total_revenue,
+         COALESCE(AVG(total), 0) AS avg_order_value,
+         SUM(CASE WHEN created_at::date = CURRENT_DATE THEN 1 ELSE 0 END) AS today_orders,
+         SUM(CASE WHEN created_at::date = CURRENT_DATE THEN total ELSE 0 END) AS today_revenue
+       FROM orders`
     );
 
-    const weekly = await pool.query(
-      `SELECT to_char(date_trunc('week', created_at), 'IYYY-IW') AS period, COUNT(*) AS count, SUM(total) AS total
+    const statusRes = await pool.query(
+      `SELECT status, COUNT(*) AS count
        FROM orders
-       GROUP BY period
-       ORDER BY period DESC
-       LIMIT 12`
+       GROUP BY status`
     );
 
-    const yearly = await pool.query(
-      `SELECT date_part('year', created_at)::int AS period, COUNT(*) AS count, SUM(total) AS total
-       FROM orders
-       GROUP BY period
-       ORDER BY period DESC`
+    const topMeserosRes = await pool.query(
+      `SELECT u.username, COUNT(o.id) AS orders_count, COALESCE(SUM(o.total),0) AS total_revenue
+       FROM orders o
+       JOIN users u ON u.id = o.mesero_id
+       GROUP BY u.username
+       ORDER BY orders_count DESC
+       LIMIT 10`
     );
 
-    res.json({ daily: daily.rows, weekly: weekly.rows, yearly: yearly.rows });
+    const topSizesRes = await pool.query(
+      `SELECT size, SUM(quantity) AS total_units, SUM(total) AS total_revenue
+       FROM order_items
+       GROUP BY size
+       ORDER BY total_units DESC
+       LIMIT 10`
+    );
+
+    const topSaboresRes = await pool.query(
+      `SELECT sabor, SUM(quantity) AS total_units
+       FROM (
+         SELECT unnest(sabores) AS sabor, quantity
+         FROM order_items
+       ) AS sub
+       GROUP BY sabor
+       ORDER BY total_units DESC
+       LIMIT 10`
+    );
+
+    res.json({
+      daily: daily.rows,
+      weekly: weekly.rows,
+      yearly: yearly.rows,
+      totals: totalsRes.rows[0],
+      status_breakdown: statusRes.rows,
+      top_meseros: topMeserosRes.rows,
+      top_sizes: topSizesRes.rows,
+      top_sabores: topSaboresRes.rows,
+    });
   } catch (e) {
     console.error('[STATS] Error fetching stats', e);
     res.status(500).json({ error: 'Error al obtener estadísticas' });
@@ -424,7 +497,7 @@ app.get("/menu", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => 
   }
 });
 
-app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => {
+app.post("/orders", orderLimiter, authMiddleware, requireRole(ROLES.MESERO), async (req, res) => {
   const { items } = req.body;
   console.log(`[ORDERS] Mesero ${req.user.username} creating order with ${items?.length || 0} items`);
   if (!Array.isArray(items) || items.length === 0) {
@@ -461,6 +534,7 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
     await client.query("BEGIN");
     const normalizedItems = [];
     let orderTotal = 0;
+    let orderClientPlate = null;
 
     for (const it of items) {
       const size = normalizeString(it.size, 16);
@@ -496,6 +570,7 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
       if (!plate) {
         return res.status(400).json({ error: "Placa o cliente es requerido en cada item" });
       }
+      if (!orderClientPlate) orderClientPlate = plate;
       const observation = normalizeString(it.observation, 240);
 
       const base = PRICE_BY_SIZE[size];
@@ -515,9 +590,12 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
       });
     }
 
+    const orderPaid = !!req.body.paid;
+    const paymentMethod = typeof req.body.payment_method === "string" ? normalizeString(req.body.payment_method, 50) : null;
+
     const orderRes = await client.query(
-      "INSERT INTO orders (mesero_id, total, status, observation) VALUES ($1,$2,'pending', NULL) RETURNING id",
-      [req.user.id, orderTotal]
+      "INSERT INTO orders (mesero_id, client_plate, total, status, observation, paid, payment_method) VALUES ($1,$2,$3,'pending', $4,$5,$6) RETURNING id",
+      [req.user.id, orderClientPlate, orderTotal, req.body.observation ? normalizeString(req.body.observation, 240) : null, orderPaid, paymentMethod]
     );
     const orderId = orderRes.rows[0].id;
     for (const it of normalizedItems) {
@@ -556,12 +634,12 @@ app.get("/orders", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => 
     let ordersRes;
     if (dateFilter) {
       ordersRes = await pool.query(
-        "SELECT id, total, status, observation, created_at FROM orders WHERE created_at::date = $1 ORDER BY created_at DESC",
+        "SELECT id, client_plate, total, status, observation, paid, payment_method, created_at FROM orders WHERE created_at::date = $1 ORDER BY created_at DESC",
         [dateFilter]
       );
     } else {
       ordersRes = await pool.query(
-        "SELECT id, total, status, observation, created_at FROM orders WHERE created_at::date = CURRENT_DATE ORDER BY created_at DESC"
+        "SELECT id, client_plate, total, status, observation, paid, payment_method, created_at FROM orders WHERE created_at::date = CURRENT_DATE ORDER BY created_at DESC"
       );
     }
     const orders = ordersRes.rows;
@@ -585,9 +663,12 @@ app.get("/orders", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => 
     }
     const formatted = orders.map((o) => ({
       id: o.id,
+      client_plate: o.client_plate || null,
       total: o.total,
       status: o.status,
       observation: o.observation || "",
+      paid: o.paid,
+      payment_method: o.payment_method || null,
       created_at: o.created_at,
       created_at_readable: new Date(o.created_at).toLocaleString("es-CO"),
       items: itemsByOrder[o.id] || [],
@@ -599,10 +680,54 @@ app.get("/orders", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => 
   }
 });
 
+app.get("/orders/recent", authMiddleware, requireRole(ROLES.CAJA, ROLES.MESERO), async (req, res) => {
+  try {
+    const ordersRes = await pool.query(
+      "SELECT id, client_plate, total, status, observation, paid, payment_method, created_at FROM orders ORDER BY created_at DESC LIMIT 20"
+    );
+    const orders = ordersRes.rows;
+    const itemsRes = await pool.query(
+      "SELECT id, order_id, plate, location, size, sabores, extras, observation, quantity, total FROM order_items WHERE order_id = ANY($1) ORDER BY id ASC",
+      [orders.map((o) => o.id)]
+    );
+    const itemsByOrder = {};
+    for (const it of itemsRes.rows) {
+      if (!itemsByOrder[it.order_id]) itemsByOrder[it.order_id] = [];
+      itemsByOrder[it.order_id].push({
+        id: it.id,
+        plate: it.plate,
+        location: it.location,
+        size: it.size,
+        sabores: it.sabores,
+        extras: it.extras,
+        observation: it.observation || "",
+        quantity: it.quantity || 1,
+        total: it.total,
+      });
+    }
+    const formatted = orders.map((o) => ({
+      id: o.id,
+      client_plate: o.client_plate || null,
+      total: o.total,
+      status: o.status,
+      observation: o.observation || "",
+      paid: o.paid,
+      payment_method: o.payment_method || null,
+      created_at: o.created_at,
+      created_at_readable: new Date(o.created_at).toLocaleString("es-CO"),
+      items: itemsByOrder[o.id] || [],
+    }));
+    res.json(formatted);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error al listar pedidos recientes" });
+  }
+});
+
 app.get("/orders/mine", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => {
   try {
     const ordersRes = await pool.query(
-      "SELECT id, total, status, observation, created_at FROM orders WHERE mesero_id = $1 AND created_at::date = CURRENT_DATE ORDER BY created_at DESC",
+      "SELECT id, client_plate, total, status, observation, paid, payment_method, created_at FROM orders WHERE mesero_id = $1 AND created_at::date = CURRENT_DATE ORDER BY created_at DESC",
       [req.user.id]
     );
     const orders = ordersRes.rows;
@@ -626,9 +751,12 @@ app.get("/orders/mine", authMiddleware, requireRole(ROLES.MESERO), async (req, r
     }
     const formatted = orders.map((o) => ({
       id: o.id,
+      client_plate: o.client_plate || null,
       total: o.total,
       status: o.status,
       observation: o.observation || "",
+      paid: o.paid,
+      payment_method: o.payment_method || null,
       created_at: o.created_at,
       created_at_readable: new Date(o.created_at).toLocaleString("es-CO"),
       items: itemsByOrder[o.id] || [],
