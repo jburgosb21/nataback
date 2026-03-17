@@ -1,16 +1,48 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || "super-secret-crema-de-nata";
+const NODE_ENV = process.env.NODE_ENV || "development";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (NODE_ENV === "production" && (!JWT_SECRET || JWT_SECRET.length < 16)) {
+  console.error("Falta JWT_SECRET (o es muy corto) en producción.");
+  process.exit(1);
+}
+
+function parseCorsOrigins() {
+  // CORS_ORIGIN ejemplo:
+  // - "http://localhost:5173,http://localhost:8888,https://tu-app.netlify.app"
+  const raw = (process.env.CORS_ORIGIN || "").trim();
+  const defaults = new Set(["http://localhost:3000", "http://localhost:5173"]);
+  if (!raw) return [...defaults];
+  const parts = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const d of defaults) parts.push(d);
+  return [...new Set(parts)];
+}
+
+const corsOrigins = parseCorsOrigins();
+app.use(
+  cors({
+    origin(origin, cb) {
+      // Requests server-to-server o herramientas sin Origin (curl/postman)
+      if (!origin) return cb(null, true);
+      if (corsOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS bloqueado para este origen: " + origin));
+    },
+    credentials: true,
+  })
+);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -24,6 +56,13 @@ const ROLES = {
   CAJA: "caja",
 };
 
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Inicializa las tablas necesarias
 async function initTables() {
   const schema = `
@@ -31,8 +70,12 @@ async function initTables() {
       id SERIAL PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('admin', 'mesero', 'bodega', 'caja'))
+      role TEXT NOT NULL CHECK (role IN ('admin', 'mesero', 'bodega', 'caja')),
+      active BOOLEAN NOT NULL DEFAULT TRUE
     );
+
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
 
     CREATE TABLE IF NOT EXISTS flavors (
       id SERIAL PRIMARY KEY,
@@ -44,19 +87,35 @@ async function initTables() {
       id SERIAL PRIMARY KEY,
       mesero_id INTEGER REFERENCES users(id),
       total INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending','cocinando','apunto_salida','entregado','cancelled')) DEFAULT 'pending',
+      observation TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+
+    ALTER TABLE orders
+      ADD COLUMN IF NOT EXISTS observation TEXT;
 
     CREATE TABLE IF NOT EXISTS order_items (
       id SERIAL PRIMARY KEY,
       order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
       plate TEXT,
       location TEXT,
-      size TEXT NOT NULL CHECK (size IN ('pequeno', 'mediano', 'grande')),
+      size TEXT NOT NULL CHECK (size IN ('mini','pequeno', 'mediano', 'grande')),
       sabores TEXT[] NOT NULL,
       extras JSONB NOT NULL,
+      observation TEXT,
+      quantity INTEGER NOT NULL DEFAULT 1,
       total INTEGER NOT NULL
     );
+
+    ALTER TABLE order_items
+      ADD COLUMN IF NOT EXISTS observation TEXT;
+
+    ALTER TABLE order_items
+      ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1;
   `;
   await pool.query(schema);
 }
@@ -66,27 +125,8 @@ initTables().then(() => {
 }).catch(err => {
   console.error("Error al inicializar tablas:", err);
 });
-// Crear usuario administrador 'nata' si no existe
-async function createAdminUser() {
-  const username = 'nata';
-  const password = '123456';
-  const role = ROLES.ADMIN;
-  const hash = await bcrypt.hash(password, 10);
-  const res = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-  if (res.rows.length === 0) {
-    await pool.query(
-      'INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)',
-      [username, hash, role]
-    );
-    console.log('Usuario administrador "nata" creado.');
-  } else {
-    console.log('Usuario administrador "nata" ya existe.');
-  }
-}
-
-createAdminUser().catch(err => {
-  console.error('Error creando usuario administrador:', err);
-});
+// Nota: el usuario administrador se crea con:
+// `npm run init:admin` usando ADMIN_USERNAME / ADMIN_PASSWORD
 
 function generateToken(user) {
   return jwt.sign(
@@ -112,6 +152,9 @@ function authMiddleware(req, res, next) {
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: "No autorizado" });
+    if (req.user.role === ROLES.ADMIN) {
+      return next();
+    }
     if (!roles.includes(req.user.role)) {
       return res.status(403).json({ error: "Permisos insuficientes" });
     }
@@ -119,64 +162,77 @@ function requireRole(...roles) {
   };
 }
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", loginLimiter, async (req, res) => {
   const { username, password } = req.body;
+  console.log(`[AUTH] Login attempt for username=${username}`);
   if (!username || !password) {
+    console.log('[AUTH] Missing credentials');
     return res.status(400).json({ error: "Faltan credenciales" });
   }
   try {
     const { rows } = await pool.query(
-      "SELECT id, username, password_hash, role FROM users WHERE username = $1",
+      "SELECT id, username, password_hash, role, active FROM users WHERE username = $1",
       [username]
     );
+    if (rows.length > 0 && rows[0].active === false) {
+      return res.status(403).json({ error: "Usuario desactivado" });
+    }
     if (rows.length === 0) {
+      console.log(`[AUTH] User not found: ${username}`);
       return res.status(401).json({ error: "Usuario o contraseña incorrectos" });
     }
     const user = rows[0];
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) {
+      console.log(`[AUTH] Invalid password for: ${username}`);
       return res.status(401).json({ error: "Usuario o contraseña incorrectos" });
     }
     const token = generateToken(user);
+    console.log(`[AUTH] Login successful for: ${username}`);
     res.json({
       token,
       user: { id: user.id, username: user.username, role: user.role },
     });
   } catch (e) {
-    console.error(e);
+    console.error('[AUTH] Server error', e);
     res.status(500).json({ error: "Error en el servidor" });
   }
 });
 
 app.get("/users", authMiddleware, requireRole(ROLES.ADMIN), async (req, res) => {
+  console.log(`[USERS] Admin ${req.user.username} requested user list`);
   try {
     const { rows } = await pool.query(
-      "SELECT id, username, role FROM users ORDER BY id ASC"
+      "SELECT id, username, role, active FROM users ORDER BY id ASC"
     );
     res.json(rows);
   } catch (e) {
-    console.error(e);
+    console.error('[USERS] Error fetching users', e);
     res.status(500).json({ error: "Error al listar usuarios" });
   }
 });
 
 app.post("/users", authMiddleware, requireRole(ROLES.ADMIN), async (req, res) => {
-  const { username, password, role } = req.body;
+  const { username, password, role, active } = req.body;
+  console.log(`[USERS] Admin ${req.user.username} creating user ${username} role=${role} active=${active}`);
   if (!username || !password || !role) {
+    console.log('[USERS] Missing data for user creation');
     return res.status(400).json({ error: "Datos incompletos" });
   }
   if (![ROLES.MESERO, ROLES.BODEGA, ROLES.CAJA].includes(role)) {
+    console.log(`[USERS] Invalid role provided: ${role}`);
     return res.status(400).json({ error: "Rol inválido" });
   }
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      "INSERT INTO users (username, password_hash, role) VALUES ($1,$2,$3) RETURNING id, username, role",
-      [username, hash, role]
+      "INSERT INTO users (username, password_hash, role, active) VALUES ($1,$2,$3,$4) RETURNING id, username, role, active",
+      [username, hash, role, active === false ? false : true]
     );
+    console.log(`[USERS] User created: ${rows[0].username}`);
     res.status(201).json(rows[0]);
   } catch (e) {
-    console.error(e);
+    console.error('[USERS] Error creating user', e);
     res.status(500).json({ error: "Error al crear usuario" });
   }
 });
@@ -198,13 +254,107 @@ app.get(
   }
 );
 
+app.patch("/users/:id", authMiddleware, requireRole(ROLES.ADMIN), async (req, res) => {
+  const { id } = req.params;
+  const { username, password, active, role } = req.body;
+  try {
+    const { rows: existing } = await pool.query("SELECT id, role FROM users WHERE id = $1", [id]);
+    if (existing.length === 0) {
+      return res.status(404).json({ error: "Usuario no encontrado" });
+    }
+    if (existing[0].role === ROLES.ADMIN) {
+      if (role && role !== ROLES.ADMIN) {
+        return res.status(403).json({ error: "No se puede cambiar el rol de otro administrador" });
+      }
+      if (active === false) {
+        return res.status(403).json({ error: "No se puede desactivar administrador" });
+      }
+    }
+
+    const updates = [];
+    const params = [];
+    let idx = 1;
+
+    if (username) {
+      updates.push(`username = $${idx++}`);
+      params.push(username);
+    }
+    if (password) {
+      const hash = await bcrypt.hash(password, 10);
+      updates.push(`password_hash = $${idx++}`);
+      params.push(hash);
+    }
+    if (active !== undefined) {
+      updates.push(`active = $${idx++}`);
+      params.push(active);
+    }
+    if (role) {
+      if (![ROLES.ADMIN, ROLES.MESERO, ROLES.BODEGA, ROLES.CAJA].includes(role)) {
+        return res.status(400).json({ error: "Rol inválido" });
+      }
+      updates.push(`role = $${idx++}`);
+      params.push(role);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "Ningún campo para actualizar" });
+    }
+
+    params.push(id);
+    const query = `UPDATE users SET ${updates.join(", ")} WHERE id = $${idx} RETURNING id, username, role, active`;
+    const { rows } = await pool.query(query, params);
+    console.log(`[USERS] Admin ${req.user.username} updated user ${id}`);
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') {
+      return res.status(409).json({ error: 'Nombre de usuario duplicado' });
+    }
+    console.error('[USERS] Error updating user', e);
+    res.status(500).json({ error: "Error al actualizar usuario" });
+  }
+});
+
+app.get("/stats", authMiddleware, requireRole(ROLES.ADMIN), async (req, res) => {
+  try {
+    const daily = await pool.query(
+      `SELECT to_char(created_at, 'YYYY-MM-DD') AS period, COUNT(*) AS count, SUM(total) AS total
+       FROM orders
+       GROUP BY period
+       ORDER BY period DESC
+       LIMIT 30`
+    );
+
+    const weekly = await pool.query(
+      `SELECT to_char(date_trunc('week', created_at), 'IYYY-IW') AS period, COUNT(*) AS count, SUM(total) AS total
+       FROM orders
+       GROUP BY period
+       ORDER BY period DESC
+       LIMIT 12`
+    );
+
+    const yearly = await pool.query(
+      `SELECT date_part('year', created_at)::int AS period, COUNT(*) AS count, SUM(total) AS total
+       FROM orders
+       GROUP BY period
+       ORDER BY period DESC`
+    );
+
+    res.json({ daily: daily.rows, weekly: weekly.rows, yearly: yearly.rows });
+  } catch (e) {
+    console.error('[STATS] Error fetching stats', e);
+    res.status(500).json({ error: 'Error al obtener estadísticas' });
+  }
+});
+
 app.post(
   "/inventory",
   authMiddleware,
   requireRole(ROLES.BODEGA),
   async (req, res) => {
     const { nombre, estado } = req.body;
+    console.log(`[INVENTORY] Bodega ${req.user.username} adding flavor ${nombre} (${estado})`);
     if (!nombre) {
+      console.log('[INVENTORY] Missing flavor name');
       return res.status(400).json({ error: "Nombre requerido" });
     }
     const finalEstado = ["bien", "poco", "nada"].includes(estado)
@@ -215,9 +365,10 @@ app.post(
         "INSERT INTO flavors (nombre, estado) VALUES ($1,$2) RETURNING id, nombre, estado",
         [nombre, finalEstado]
       );
+      console.log(`[INVENTORY] Flavor created id=${rows[0].id} name=${rows[0].nombre}`);
       res.status(201).json(rows[0]);
     } catch (e) {
-      console.error(e);
+      console.error('[INVENTORY] Error creating flavor', e);
       res.status(500).json({ error: "Error al crear sabor" });
     }
   }
@@ -263,23 +414,95 @@ app.get("/menu", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => 
 
 app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => {
   const { items } = req.body;
+  console.log(`[ORDERS] Mesero ${req.user.username} creating order with ${items?.length || 0} items`);
   if (!Array.isArray(items) || items.length === 0) {
+    console.log('[ORDERS] No items provided for order');
     return res.status(400).json({ error: "Items requeridos" });
   }
+
+  const PRICE_BY_SIZE = {
+    pequeno: 2000,
+    mediano: 3000,
+    grande: 4000,
+    mini: 1500,
+  };
+  const EXTRA_GALLETA_PRICE = 500;
+  const validLocations = new Set(["parqueadero", "calle", "mesas"]);
+
+  function normalizeString(s, maxLen) {
+    if (typeof s !== "string") return "";
+    const out = s.trim().replace(/\s+/g, " ");
+    return out.slice(0, maxLen);
+  }
+
+  function normalizeSabores(arr) {
+    if (!Array.isArray(arr)) return [];
+    const clean = arr
+      .map((s) => normalizeString(s, 40))
+      .filter(Boolean);
+    return [...new Set(clean)];
+  }
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const orderTotal = items.reduce((sum, it) => sum + (it.total || 0), 0);
+    const normalizedItems = [];
+    let orderTotal = 0;
+
+    for (const it of items) {
+      const size = normalizeString(it.size, 16);
+      if (!PRICE_BY_SIZE[size]) {
+        return res.status(400).json({ error: `Tamaño inválido: ${size}` });
+      }
+
+      const quantity = Number.isInteger(it.quantity) && it.quantity > 0 ? it.quantity : 1;
+      const sabores = normalizeSabores(it.sabores);
+      if (sabores.length === 0) {
+        return res.status(400).json({ error: "Cada helado debe tener al menos 1 sabor" });
+      }
+
+      const extras = typeof it.extras === "object" && it.extras ? it.extras : {};
+      const extrasNormalized = {
+        salsa: !!extras.salsa,
+        chispa: !!extras.chispa,
+        galleta: !!extras.galleta,
+      };
+
+      const location = normalizeString(it.location, 20);
+      if (location && !validLocations.has(location)) {
+        return res.status(400).json({ error: `Ubicación inválida: ${location}` });
+      }
+
+      const plate = normalizeString(it.plate, 12).toUpperCase();
+      const observation = normalizeString(it.observation, 240);
+
+      const base = PRICE_BY_SIZE[size];
+      const extrasPrice = extrasNormalized.galleta ? EXTRA_GALLETA_PRICE : 0;
+      const itemTotal = (base + extrasPrice) * quantity;
+
+      orderTotal += itemTotal;
+      normalizedItems.push({
+        plate: plate || null,
+        location: location || null,
+        size,
+        sabores,
+        extras: extrasNormalized,
+        observation: observation || null,
+        quantity,
+        total: itemTotal,
+      });
+    }
+
     const orderRes = await client.query(
-      "INSERT INTO orders (mesero_id, total) VALUES ($1,$2) RETURNING id",
+      "INSERT INTO orders (mesero_id, total, status, observation) VALUES ($1,$2,'pending', NULL) RETURNING id",
       [req.user.id, orderTotal]
     );
     const orderId = orderRes.rows[0].id;
-    for (const it of items) {
+    for (const it of normalizedItems) {
       await client.query(
         `INSERT INTO order_items 
-        (order_id, plate, location, size, sabores, extras, total) 
-        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        (order_id, plate, location, size, sabores, extras, observation, quantity, total) 
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [
           orderId,
           it.plate || null,
@@ -287,15 +510,18 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
           it.size,
           it.sabores,
           it.extras,
+          it.observation,
+          it.quantity,
           it.total,
         ]
       );
     }
     await client.query("COMMIT");
+    console.log(`[ORDERS] Order created id=${orderId} total=${orderTotal}`);
     res.status(201).json({ id: orderId });
   } catch (e) {
     await client.query("ROLLBACK");
-    console.error(e);
+    console.error('[ORDERS] Error creating order', e);
     res.status(500).json({ error: "Error al crear pedido" });
   } finally {
     client.release();
@@ -304,12 +530,21 @@ app.post("/orders", authMiddleware, requireRole(ROLES.MESERO), async (req, res) 
 
 app.get("/orders", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => {
   try {
-    const ordersRes = await pool.query(
-      "SELECT id, total, created_at FROM orders ORDER BY created_at DESC LIMIT 50"
-    );
+    const dateFilter = req.query.date || null;
+    let ordersRes;
+    if (dateFilter) {
+      ordersRes = await pool.query(
+        "SELECT id, total, status, observation, created_at FROM orders WHERE created_at::date = $1 ORDER BY created_at DESC",
+        [dateFilter]
+      );
+    } else {
+      ordersRes = await pool.query(
+        "SELECT id, total, status, observation, created_at FROM orders WHERE created_at::date = CURRENT_DATE ORDER BY created_at DESC"
+      );
+    }
     const orders = ordersRes.rows;
     const itemsRes = await pool.query(
-      "SELECT id, order_id, plate, location, size, sabores, extras, total FROM order_items ORDER BY id ASC"
+      "SELECT id, order_id, plate, location, size, sabores, extras, observation, quantity, total FROM order_items ORDER BY id ASC"
     );
     const itemsByOrder = {};
     for (const it of itemsRes.rows) {
@@ -321,12 +556,16 @@ app.get("/orders", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => 
         size: it.size,
         sabores: it.sabores,
         extras: it.extras,
+        observation: it.observation || "",
+        quantity: it.quantity || 1,
         total: it.total,
       });
     }
     const formatted = orders.map((o) => ({
       id: o.id,
       total: o.total,
+      status: o.status,
+      observation: o.observation || "",
       created_at: o.created_at,
       created_at_readable: new Date(o.created_at).toLocaleString("es-CO"),
       items: itemsByOrder[o.id] || [],
@@ -335,6 +574,98 @@ app.get("/orders", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => 
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Error al listar pedidos" });
+  }
+});
+
+app.get("/orders/mine", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => {
+  try {
+    const ordersRes = await pool.query(
+      "SELECT id, total, status, observation, created_at FROM orders WHERE mesero_id = $1 AND created_at::date = CURRENT_DATE ORDER BY created_at DESC",
+      [req.user.id]
+    );
+    const orders = ordersRes.rows;
+    const itemsRes = await pool.query(
+      "SELECT id, order_id, plate, location, size, sabores, extras, observation, quantity, total FROM order_items ORDER BY id ASC"
+    );
+    const itemsByOrder = {};
+    for (const it of itemsRes.rows) {
+      if (!itemsByOrder[it.order_id]) itemsByOrder[it.order_id] = [];
+      itemsByOrder[it.order_id].push({
+        id: it.id,
+        plate: it.plate,
+        location: it.location,
+        size: it.size,
+        sabores: it.sabores,
+        extras: it.extras,
+        observation: it.observation || "",
+        quantity: it.quantity || 1,
+        total: it.total,
+      });
+    }
+    const formatted = orders.map((o) => ({
+      id: o.id,
+      total: o.total,
+      status: o.status,
+      observation: o.observation || "",
+      created_at: o.created_at,
+      created_at_readable: new Date(o.created_at).toLocaleString("es-CO"),
+      items: itemsByOrder[o.id] || [],
+    }));
+    res.json(formatted);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error al listar mis pedidos" });
+  }
+});
+
+app.patch("/orders/:id/status", authMiddleware, requireRole(ROLES.CAJA), async (req, res) => {
+  const { id } = req.params;
+  const { status, observation } = req.body;
+  const validStatuses = ["pending", "cocinando", "apunto_salida", "entregado", "cancelled"];
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: "Estado inválido" });
+  }
+
+  try {
+    const current = await pool.query("SELECT status FROM orders WHERE id = $1", [id]);
+    if (current.rows.length === 0) return res.status(404).json({ error: "Pedido no encontrado" });
+    const curStatus = current.rows[0].status;
+    if (curStatus === "cancelled") return res.status(400).json({ error: "No se puede editar pedido cancelado" });
+    if (curStatus === "entregado") return res.status(400).json({ error: "No se puede cambiar un pedido entregado" });
+
+    const allowedTransitions = {
+      pending: ["cocinando", "apunto_salida", "entregado", "cancelled"],
+      cocinando: ["apunto_salida", "entregado", "cancelled"],
+      apunto_salida: ["entregado", "cancelled"],
+    };
+
+    if (!allowedTransitions[curStatus]?.includes(status)) {
+      return res.status(400).json({ error: `Transición no permitida: ${curStatus} -> ${status}` });
+    }
+
+    const order = await pool.query("UPDATE orders SET status = $1, observation = COALESCE($2, observation) WHERE id = $3 RETURNING id, status, observation", [status, observation || null, id]);
+    res.json(order.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error al actualizar estado" });
+  }
+});
+
+app.patch("/orders/:id/cancel", authMiddleware, requireRole(ROLES.MESERO), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query("SELECT mesero_id, status FROM orders WHERE id = $1", [id]);
+    if (check.rows.length === 0) return res.status(404).json({ error: "Pedido no encontrado" });
+    if (check.rows[0].mesero_id !== req.user.id) return res.status(403).json({ error: "No puede cancelar pedido de otro mesero" });
+    if (check.rows[0].status === "cancelled") return res.status(400).json({ error: "Pedido ya cancelado" });
+
+    await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [id]);
+    console.log(`[ORDERS] Pedido ${id} cancelado por mesero ${req.user.username}`);
+    res.json({ success: true, message: "Pedido cancelado" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error al cancelar pedido" });
   }
 });
 
